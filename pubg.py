@@ -7,7 +7,7 @@ import random
 import datetime
 import os
 
-BOT_TOKEN = "8113191674:AAH53HO3iIvgIqlGSwMkuoC4jNd2EMS0qS8"
+BOT_TOKEN = "8113191674:AAEZs4N9NtKF5lSa3WLIIV9oO_t5b9tHVkg"
 CHANNEL_ID = "@swKoMBaT"
 GROUP_ID = "@swKoMBaT1"
 YOUTUBE_LINK = "https://youtube.com/@swkombat?si=5vVIGfj_NYx-yJLK"
@@ -349,3 +349,4 @@ def start(message):
 if __name__ == "__main__":
     init_db()
     bot.infinity_polling()
+
