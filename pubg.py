@@ -1016,3 +1016,4 @@ if __name__ == "__main__":
                 bot.send_message(admin, f"Bot crashed: {e}")
             except Exception:
                 pass
+
