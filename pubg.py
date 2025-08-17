@@ -33,7 +33,7 @@ def run_server():
     server.serve_forever()
 
 # Bot Configuration
-BOT_TOKEN = os.environ.get("8113191674:AAEZs4N9NtKF5lSa3WLIIV9oO_t5b9tHVkg")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = "@swKoMBaT"
 GROUP_ID = "@swKoMBaT1"
 YOUTUBE_LINK = "https://youtube.com/@swkombat?si=5vVIGfj_NYx-yJLK"
@@ -663,3 +663,4 @@ if __name__ == "__main__":
                 bot.send_message(admin, f"Bot crashed: {e}")
             except:
                 pass
+
