@@ -2,29 +2,10 @@
 """
 pubg.py - Complete Telegram bot for PUBG UC referrals and competitions
 
-Features:
-- BOT_TOKEN read from environment variable (unchanged behavior).
-- CHANNEL_ID, GROUP_ID, ADMIN_IDS, YOUTUBE_LINK configurable via environment.
-- Referral system: /start [ref_id] logs users and gives referrer 3 UC per confirmed referral.
-- UC section: admin can set UC image (/set_uc_image). "🪙 UC islash" sends UC image (if set),
-  referral link, guidance and a "Do'stlarni taklif qilish" (share) button.
-- Competitions: admin can create competitions (image -> caption -> deadline -> winners).
-  Competitions are automatically posted to CHANNEL_ID and GROUP_ID with inline "✅ Qatnashish (N)".
-- Join flow:
-  - If user subscribed: added immediately and DM'd confirmation + UC guidance.
-  - If not subscribed: bot DMs subscription instructions with "✅ Obuna bo'ldim" (confirm_sub_{comp_id}).
-    When user confirms and subscription verified, they're added automatically.
-  - If DM cannot be delivered (user hasn't /start-ed), callback instructs to open bot and /start.
-- Background worker:
-  - Periodically removes unsubscribed participants and updates posts.
-  - Finalizes competitions when deadline passed: picks winners, announces in channel/group and DMs winners.
-- Data stored as JSON files: users.json, competitions.json, devices.json.
-- Safe next-step handler wrapper ensures subscription guard applied to registrations.
-- Logging prints to console. Ensure bot has post/edit permissions in channel/group.
-
-Usage:
-- Set BOT_TOKEN in environment. Optionally set CHANNEL_ID, GROUP_ID, ADMIN_IDS, YOUTUBE_LINK.
-- Run: python3 pubg.py
+This version starts a small Flask health server bound to the PORT environment variable
+so deployment platforms that scan for open ports (Render/Heroku etc.) detect the service.
+Keep BOT_TOKEN in environment. If Flask is not installed, install it (pip install flask)
+or mark the process as a background worker in your host.
 """
 
 import os
@@ -918,17 +899,40 @@ def handler_back(message: types.Message):
         pass
 
 # -----------------------
-# Utilities
+# Run bot and health server
 # -----------------------
-# Keep load_json/save_json alias consistent (they already exist above)
+def start_flask_health():
+    try:
+        from flask import Flask
+    except Exception as e:
+        print("Flask is not installed. To bind a web port for deployments, install flask (pip install flask).")
+        return None
 
-# -----------------------
-# Run bot
-# -----------------------
+    app = Flask(__name__)
+
+    @app.route("/", methods=["GET"])
+    def health():
+        return "OK", 200
+
+    port = int(os.environ.get("PORT", 10000))
+    def run():
+        # bind to 0.0.0.0 so platform can reach it
+        app.run(host="0.0.0.0", port=port)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    print(f"Flask health server started on port {port}")
+    return t
+
 if __name__ == "__main__":
     print("Starting pubg.py bot...")
+    # Start background worker
     worker = threading.Thread(target=background_worker, daemon=True)
     worker.start()
+
+    # Start Flask health server so deployment detects an open port
+    flask_thread = start_flask_health()
+
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
     except KeyboardInterrupt:
