@@ -1,11 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-pubg.py - Complete Telegram bot for PUBG UC referrals and competitions
+pubg.py - Complete Telegram bot for PUBG UC referrals, balance, withdrawals,
+ratings and competitions (admin tools), ready for Heroku (webhook) deployment.
 
-This version starts a small Flask health server bound to the PORT environment variable
-so deployment platforms that scan for open ports (Render/Heroku etc.) detect the service.
-Keep BOT_TOKEN in environment. If Flask is not installed, install it (pip install flask)
-or mark the process as a background worker in your host.
+Key points:
+- Uses Flask webhook endpoint so it works on Heroku/Railway/Render web dynos.
+- Exposes `server` (Flask app) so `Procfile` can be:  web: gunicorn pubg:server
+- Starts a background thread for periodic maintenance (unsubscribe cleanup,
+  auto-finish expired competitions).
+- Stores simple data in JSON files (users.json, competitions.json, devices.json).
+
+Environment variables expected (Heroku Config Vars):
+- BOT_TOKEN         : Telegram bot token (required)
+- HEROKU_APP_NAME   : Your Heroku app name, e.g. "my-bot-app"  (optional if WEBHOOK_URL set)
+- WEBHOOK_URL       : Full HTTPS webhook base URL, e.g. "https://my.domain.com" (optional)
+- CHANNEL_ID        : e.g. "@swKoMBaT"
+- GROUP_ID          : e.g. "@swKoMBaT1"
+- YOUTUBE_LINK      : YouTube channel URL (optional)
+- ADMIN_IDS         : Comma separated Telegram user IDs: "111,222" (optional)
+
+Files created at runtime (JSON stores):
+- users.json          : { user_id: {uc, ref, refs[], joined} }
+- competitions.json   : { comp_id: {...} }
+- devices.json        : misc small settings (e.g., UC image file_id)
+
+Procfile example:
+    web: gunicorn pubg:server
+
+requirements.txt (minimal):
+    pyTelegramBotAPI>=4.0.0
+    Flask>=2.0
+    gunicorn>=20.0.4
+    python-dotenv>=0.21.0
 """
 
 import os
@@ -20,6 +46,7 @@ from datetime import datetime, date, timedelta
 
 import telebot
 from telebot import types
+from flask import Flask, request
 
 # -----------------------
 # Configuration
@@ -38,8 +65,11 @@ if os.environ.get("ADMIN_IDS"):
     except Exception:
         ADMIN_IDS = []
 else:
-    # Replace with your admin IDs if desired
-    ADMIN_IDS = [6322816106, 6072785933]
+    ADMIN_IDS = [6322816106]  # put your admin IDs here if desired
+
+# Optional explicit webhook URL (overrides HEROKU_APP_NAME)
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g., https://mydomain.com
+HEROKU_APP_NAME = os.environ.get("HEROKU_APP_NAME")  # e.g., my-bot-app
 
 USERS_FILE = "users.json"
 COMPS_FILE = "competitions.json"
@@ -51,7 +81,8 @@ for fname in (USERS_FILE, COMPS_FILE, DEVICES_FILE):
         with open(fname, "w", encoding="utf-8") as f:
             json.dump({}, f, ensure_ascii=False, indent=2)
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# Telegram bot
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
 # In-memory admin drafts and pending join contexts
 comp_drafts: Dict[int, Dict[str, Any]] = {}
@@ -60,6 +91,7 @@ pending_joins: Dict[int, str] = {}  # user_id -> comp_id waiting for subscriptio
 # -----------------------
 # JSON helpers
 # -----------------------
+
 def load_json(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -67,13 +99,18 @@ def load_json(path: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
+
 def save_json(path: str, data: Dict[str, Any]):
-    with open(path, "w", encoding="utf-8") as fh:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
 
 # -----------------------
 # Subscription check & prompt
 # -----------------------
+
 def check_subscription(user_id: int) -> bool:
     """
     Return True if user is member/administrator/creator in both CHANNEL_ID and GROUP_ID.
@@ -88,6 +125,7 @@ def check_subscription(user_id: int) -> bool:
     except Exception as e:
         print(f"[check_subscription] user={user_id} error: {e}")
         return False
+
 
 def send_subscription_prompt(user_id: int, comp_id: Optional[str] = None) -> bool:
     """
@@ -120,6 +158,7 @@ def send_subscription_prompt(user_id: int, comp_id: Optional[str] = None) -> boo
         print(f"[send_subscription_prompt] DM failed to {user_id}: {e}")
         return False
 
+
 @bot.callback_query_handler(func=lambda c: c.data == "check_sub")
 def callback_check_sub(call: types.CallbackQuery):
     uid = call.from_user.id
@@ -136,9 +175,11 @@ def callback_check_sub(call: types.CallbackQuery):
         except Exception:
             pass
 
+
 # -----------------------
 # Decorators and safe next-step
 # -----------------------
+
 def subscription_guard_message(handler):
     @functools.wraps(handler)
     def wrapper(message, *args, **kwargs):
@@ -152,14 +193,15 @@ def subscription_guard_message(handler):
         if not check_subscription(uid):
             sent = send_subscription_prompt(uid)
             if not sent:
-                # instruct user to open bot
                 try:
                     bot.send_message(uid, f"Iltimos, botga yozing: https://t.me/{bot.get_me().username} va /start ni bosing.")
                 except Exception:
                     pass
             return
         return handler(message, *args, **kwargs)
+
     return wrapper
+
 
 def subscription_guard_callback(handler):
     @functools.wraps(handler)
@@ -171,7 +213,6 @@ def subscription_guard_callback(handler):
         if call.data == "check_sub":
             return handler(call, *args, **kwargs)
         if not check_subscription(uid):
-            # generic prompt
             sent = send_subscription_prompt(uid)
             if sent:
                 try:
@@ -185,15 +226,19 @@ def subscription_guard_callback(handler):
                     pass
             return
         return handler(call, *args, **kwargs)
+
     return wrapper
+
 
 def safe_register_next_step_handler(msg, callback, *args, **kwargs):
     wrapped = subscription_guard_message(callback)
     return bot.register_next_step_handler(msg, wrapped, *args, **kwargs)
 
+
 # -----------------------
 # Main menu
 # -----------------------
+
 def main_menu(uid: int) -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     buttons = ["🪙 UC islash", "📊 Referal reyting", "💰 UC balans", "💸 UC yechish"]
@@ -205,9 +250,11 @@ def main_menu(uid: int) -> types.ReplyKeyboardMarkup:
         kb.row(buttons[4])
     return kb
 
+
 # -----------------------
 # Users & referrals
 # -----------------------
+
 def add_user(user_id: int, ref_id: Optional[str] = None):
     users = load_json(USERS_FILE)
     uid = str(user_id)
@@ -216,7 +263,7 @@ def add_user(user_id: int, ref_id: Optional[str] = None):
             "uc": 0,
             "ref": str(ref_id) if ref_id else None,
             "refs": [],
-            "joined": str(date.today())
+            "joined": str(date.today()),
         }
         # credit referrer if exists
         if ref_id and str(ref_id) in users:
@@ -224,9 +271,11 @@ def add_user(user_id: int, ref_id: Optional[str] = None):
             users[str(ref_id)]["uc"] = users[str(ref_id)].get("uc", 0) + 3
         save_json(USERS_FILE, users)
 
+
 # -----------------------
 # UC islash & admin set image
 # -----------------------
+
 @bot.message_handler(func=lambda m: m.text == "🪙 UC islash")
 @subscription_guard_message
 def uc_ishlash(message: types.Message):
@@ -251,7 +300,9 @@ def uc_ishlash(message: types.Message):
     devices = load_json(DEVICES_FILE)
     file_id = devices.get("uc_image", {}).get("file_id")
 
-    share_text = urllib.parse.quote_plus(f"Men UC olish uchun bu kanalda qatnashaman! Siz ham qo'shiling: {ref_link}")
+    share_text = urllib.parse.quote_plus(
+        f"Men UC olish uchun bu kanalda qatnashaman! Siz ham qo'shiling: {ref_link}"
+    )
     share_url = f"https://t.me/share/url?url={urllib.parse.quote_plus(ref_link)}&text={share_text}"
 
     inline = types.InlineKeyboardMarkup()
@@ -266,10 +317,21 @@ def uc_ishlash(message: types.Message):
             bot.send_photo(uid, file_id, caption=guidance, reply_markup=inline)
         else:
             bot.send_message(uid, guidance, reply_markup=inline)
-        bot.send_message(uid, "📤 Do'stlaringizga yuborish uchun 'Do'stlarni taklif qilish' tugmasidan foydalaning.", reply_markup=reply)
+        bot.send_message(
+            uid,
+            "📤 Do'stlaringizga yuborish uchun 'Do'stlarni taklif qilish' tugmasidan foydalaning.",
+            reply_markup=reply,
+        )
     except Exception as e:
         print(f"[uc_ishlash] DM failed to {uid}: {e}")
-        bot.send_message(message.chat.id, f"Iltimos botga yozing: https://t.me/{bot.get_me().username} va /start ni bosing.")
+        try:
+            bot.send_message(
+                message.chat.id,
+                f"Iltimos botga yozing: https://t.me/{bot.get_me().username} va /start ni bosing.",
+            )
+        except Exception:
+            pass
+
 
 @bot.message_handler(commands=["set_uc_image"])
 @subscription_guard_message
@@ -281,6 +343,7 @@ def cmd_set_uc_image(message: types.Message):
     kb.row("🔙 Ortga")
     msg = bot.send_message(message.chat.id, "Iltimos UC rasmi yuboring (yoki '🔙 Ortga'):", reply_markup=kb)
     safe_register_next_step_handler(msg, process_set_uc_image)
+
 
 def process_set_uc_image(message: types.Message):
     if getattr(message, "text", "") and message.text == "🔙 Ortga":
@@ -296,11 +359,17 @@ def process_set_uc_image(message: types.Message):
     devices = load_json(DEVICES_FILE)
     devices.setdefault("uc_image", {})["file_id"] = file_id
     save_json(DEVICES_FILE, devices)
-    bot.send_message(message.chat.id, "✅ UC rasmi saqlandi.", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).row("🔙 Ortga"))
+    bot.send_message(
+        message.chat.id,
+        "✅ UC rasmi saqlandi.",
+        reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).row("🔙 Ortga"),
+    )
+
 
 # -----------------------
 # Referral rating
 # -----------------------
+
 @bot.message_handler(func=lambda m: m.text == "📊 Referal reyting")
 @subscription_guard_message
 def referral_menu(message: types.Message):
@@ -309,6 +378,7 @@ def referral_menu(message: types.Message):
     kb.row("🔙 Ortga")
     bot.send_message(message.chat.id, "Referal reyting uchun davrni tanlang:", reply_markup=kb)
 
+
 @bot.message_handler(func=lambda m: m.text == "🔄 Oxirgi 7 kun")
 @subscription_guard_message
 def last_7_days_rating(message: types.Message):
@@ -316,11 +386,13 @@ def last_7_days_rating(message: types.Message):
     start = end - timedelta(days=7)
     show_referral_rating(message.chat.id, start, end)
 
+
 @bot.message_handler(func=lambda m: m.text == "📅 Boshqa davr")
 @subscription_guard_message
 def ask_custom_dates(message: types.Message):
     msg = bot.send_message(message.chat.id, "Boshlanish sanasini yuboring (YYYY-MM-DD):")
     safe_register_next_step_handler(msg, process_start_date)
+
 
 def process_start_date(message: types.Message):
     if getattr(message, "text", "") and message.text == "🔙 Ortga":
@@ -333,6 +405,7 @@ def process_start_date(message: types.Message):
         return
     msg = bot.send_message(message.chat.id, "Tugash sanasini yuboring (YYYY-MM-DD):")
     safe_register_next_step_handler(msg, process_end_date, start)
+
 
 def process_end_date(message: types.Message, start_date: date):
     if getattr(message, "text", "") and message.text == "🔙 Ortga":
@@ -347,6 +420,7 @@ def process_end_date(message: types.Message, start_date: date):
         bot.send_message(message.chat.id, "Tugash sanasi boshlanish sanasidan oldin bo'lishi mumkin emas.")
         return
     show_referral_rating(message.chat.id, start_date, end)
+
 
 def show_referral_rating(chat_id: int, start_date: date, end_date: date):
     users = load_json(USERS_FILE)
@@ -376,15 +450,18 @@ def show_referral_rating(chat_id: int, start_date: date, end_date: date):
         lines.append(f"{i}. {display} — {cnt} {suffix}")
     bot.send_message(chat_id, "\n".join(lines))
 
+
 # -----------------------
 # UC balance & withdraw
 # -----------------------
+
 @bot.message_handler(func=lambda m: m.text == "💰 UC balans")
 @subscription_guard_message
 def uc_balance(message: types.Message):
     users = load_json(USERS_FILE)
     uc = users.get(str(message.from_user.id), {}).get("uc", 0)
     bot.send_message(message.chat.id, f"💰 Sizning balansingiz: {uc} UC")
+
 
 @bot.message_handler(func=lambda m: m.text == "💸 UC yechish")
 @subscription_guard_message
@@ -400,6 +477,7 @@ def uc_withdraw(message: types.Message):
             kb.add(types.InlineKeyboardButton(f"{amt} UC", callback_data=f"withdraw_{amt}"))
     bot.send_message(message.chat.id, "💳 Yechmoqchi bo'lgan UC miqdorini tanlang:", reply_markup=kb)
 
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("withdraw_"))
 @subscription_guard_callback
 def handle_withdraw(call: types.CallbackQuery):
@@ -410,6 +488,7 @@ def handle_withdraw(call: types.CallbackQuery):
     except Exception as e:
         print(f"[handle_withdraw] {e}")
         bot.answer_callback_query(call.id, "Xatolik yuz berdi", show_alert=True)
+
 
 def confirm_withdraw(message: types.Message, amount: int):
     users = load_json(USERS_FILE)
@@ -422,14 +501,19 @@ def confirm_withdraw(message: types.Message, amount: int):
     save_json(USERS_FILE, users)
     for admin in ADMIN_IDS:
         try:
-            bot.send_message(admin, f"📥 @{message.from_user.username} ({uid}) so'radi: {amount} UC\nPUBG ID: {pubg_id}")
+            bot.send_message(
+                admin,
+                f"📥 @{message.from_user.username} ({uid}) so'radi: {amount} UC\nPUBG ID: {pubg_id}",
+            )
         except Exception:
             pass
     bot.send_message(message.chat.id, "✅ So'rovingiz qabul qilindi. Tez orada ko'rib chiqiladi.")
 
+
 # -----------------------
 # Competitions: admin creation and posting
 # -----------------------
+
 @bot.message_handler(func=lambda m: m.text == "🎁 Konkurslar" and m.from_user.id in ADMIN_IDS)
 @subscription_guard_message
 def competitions_menu(message: types.Message):
@@ -438,6 +522,7 @@ def competitions_menu(message: types.Message):
     kb.row("📋 Konkurslarni ko'rish/tahrirlash")
     kb.row("🔙 Asosiy menyu")
     bot.send_message(message.chat.id, "Admin: konkurslar boshqaruvi", reply_markup=kb)
+
 
 @bot.message_handler(func=lambda m: m.text == "🆕 Yangi konkurs yaratish" and m.from_user.id in ADMIN_IDS)
 @subscription_guard_message
@@ -448,6 +533,7 @@ def start_new_competition(message: types.Message):
     kb.row("🔙 Ortga")
     msg = bot.send_message(admin, "Konkurs uchun rasm yuboring:", reply_markup=kb)
     safe_register_next_step_handler(msg, admin_process_comp_image)
+
 
 def admin_process_comp_image(message: types.Message):
     admin = message.from_user.id
@@ -471,13 +557,18 @@ def admin_process_comp_image(message: types.Message):
     msg = bot.send_message(admin, "Konkurs uchun izoh/caption yuboring (yoki '-' bo'sh):", reply_markup=kb)
     safe_register_next_step_handler(msg, admin_process_comp_caption)
 
+
 def admin_process_comp_caption(message: types.Message):
     admin = message.from_user.id
     if getattr(message, "text", "") and message.text == "🔙 Ortga":
         draft = comp_drafts.get(admin, {})
         draft["step"] = "image"
         comp_drafts[admin] = draft
-        bot.send_message(admin, "Rasm yuboring (yoki yangisini yuboring):", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).row("🔙 Ortga"))
+        bot.send_message(
+            admin,
+            "Rasm yuboring (yoki yangisini yuboring):",
+            reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).row("🔙 Ortga"),
+        )
         return
     caption = (message.text or "").strip()
     if caption == "-":
@@ -490,6 +581,7 @@ def admin_process_comp_caption(message: types.Message):
     kb.row("🔙 Ortga")
     msg = bot.send_message(admin, "Konkurs tugash vaqtini yuboring (YYYY-MM-DD HH:MM):", reply_markup=kb)
     safe_register_next_step_handler(msg, admin_process_comp_deadline)
+
 
 def admin_process_comp_deadline(message: types.Message):
     admin = message.from_user.id
@@ -515,6 +607,7 @@ def admin_process_comp_deadline(message: types.Message):
     kb.row("🔙 Ortga")
     msg = bot.send_message(admin, "G'oliblar sonini kiriting (butun son):", reply_markup=kb)
     safe_register_next_step_handler(msg, admin_process_comp_winners)
+
 
 def admin_process_comp_winners(message: types.Message):
     admin = message.from_user.id
@@ -542,13 +635,14 @@ def admin_process_comp_winners(message: types.Message):
         "winners": draft.get("winners"),
         "participants": [],
         "winners_announced": False,
-        "message_info": {}
+        "message_info": {},
     }
     save_json(COMPS_FILE, comps)
     comp_drafts.pop(admin, None)
     bot.send_message(admin, f"Konkurs #{comp_id} yaratildi va avtomatik e'lon qilinadi.")
     # post to channel and group
     post_competition(comp_id)
+
 
 def build_comp_caption(comp_id: str, comp: Dict[str, Any]) -> str:
     caption = comp.get("caption", "")
@@ -560,11 +654,12 @@ def build_comp_caption(comp_id: str, comp: Dict[str, Any]) -> str:
     text += "Ishtirok etish uchun pastdagi tugmani bosing!"
     return text
 
+
 def build_comp_keyboard(comp_id: str, participants_count: int) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton(f"✅ Qatnashish ({participants_count})", callback_data=f"join_{comp_id}"))
-    # optionally include admin quick actions in channel/group posts (not needed)
     return kb
+
 
 def post_competition(comp_id: str):
     comps = load_json(COMPS_FILE)
@@ -594,9 +689,11 @@ def post_competition(comp_id: str):
     comps[comp_id] = comp
     save_json(COMPS_FILE, comps)
 
+
 # -----------------------
 # Participant add/update helpers
 # -----------------------
+
 def add_participant(comp_id: str, user_id: int, comment: str = "") -> bool:
     comps = load_json(COMPS_FILE)
     comp = comps.get(comp_id)
@@ -610,6 +707,7 @@ def add_participant(comp_id: str, user_id: int, comment: str = "") -> bool:
     save_json(COMPS_FILE, comps)
     update_competition_posts(comp_id)
     return True
+
 
 def update_competition_posts(comp_id: str):
     comps = load_json(COMPS_FILE)
@@ -625,17 +723,26 @@ def update_competition_posts(comp_id: str):
         if not info or not info.get("message_id"):
             continue
         try:
-            bot.edit_message_caption(chat_id=info["chat_id"], message_id=info["message_id"],
-                                     caption=caption, parse_mode="Markdown", reply_markup=kb)
+            bot.edit_message_caption(
+                chat_id=info["chat_id"],
+                message_id=info["message_id"],
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
         except Exception as e1:
             try:
-                bot.edit_message_reply_markup(chat_id=info["chat_id"], message_id=info["message_id"], reply_markup=kb)
+                bot.edit_message_reply_markup(
+                    chat_id=info["chat_id"], message_id=info["message_id"], reply_markup=kb
+                )
             except Exception as e2:
                 print(f"[update_competition_posts] failed to update {comp_id} in {place}: {e1} / {e2}")
+
 
 # -----------------------
 # Join flow: callback and confirmation
 # -----------------------
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("join_"))
 def callback_join(call: types.CallbackQuery):
     comp_id = call.data.split("_", 1)[1]
@@ -673,13 +780,17 @@ def callback_join(call: types.CallbackQuery):
                 pass
             try:
                 bot.send_message(uid, "✅ Siz konkurs ishtirokchisiz! Omad tilaymiz 🎉")
-                # UC guidance
-                bot.send_message(uid,
-                                 "Ushbu bot orqali siz UC ishlashingiz mumkin.\n"
-                                 "Menyudagi '🪙 UC islash' tugmasini bosib referal havolani do'stlaringizga ulashing; har bir taklif uchun 3 UC beriladi.")
+                bot.send_message(
+                    uid,
+                    "Ushbu bot orqali siz UC ishlashingiz mumkin.\nMenyudagi '🪙 UC islash' tugmasini bosib referal havolani do'stlaringizga ulashing; har bir taklif uchun 3 UC beriladi.",
+                )
             except Exception:
                 try:
-                    bot.answer_callback_query(call.id, f"✅ Siz konkursga qo'shildingiz. Iltimos botni oching: https://t.me/{bot.get_me().username}", show_alert=True)
+                    bot.answer_callback_query(
+                        call.id,
+                        f"✅ Siz konkursga qo'shildingiz. Iltimos botni oching: https://t.me/{bot.get_me().username}",
+                        show_alert=True,
+                    )
                 except Exception:
                     pass
         else:
@@ -694,15 +805,24 @@ def callback_join(call: types.CallbackQuery):
     if sent:
         pending_joins[uid] = comp_id
         try:
-            bot.answer_callback_query(call.id, "❗ Sizga shaxsiy xabar yubordim — obuna bo'ling va '✅ Obuna bo'ldim' tugmasini bosing.", show_alert=True)
+            bot.answer_callback_query(
+                call.id,
+                "❗ Sizga shaxsiy xabar yubordim — obuna bo'ling va '✅ Obuna bo'ldim' tugmasini bosing.",
+                show_alert=True,
+            )
         except Exception:
             pass
     else:
         # DM failed -> instruct to open bot and /start
         try:
-            bot.answer_callback_query(call.id, f"Iltimos botga yozing: https://t.me/{bot.get_me().username} va /start bosing, keyin qaytadan tugmani bosing.", show_alert=True)
+            bot.answer_callback_query(
+                call.id,
+                f"Iltimos botga yozing: https://t.me/{bot.get_me().username} va /start bosing, keyin qaytadan tugmani bosing.",
+                show_alert=True,
+            )
         except Exception:
             pass
+
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("confirm_sub_"))
 def callback_confirm_sub(call: types.CallbackQuery):
@@ -714,14 +834,12 @@ def callback_confirm_sub(call: types.CallbackQuery):
         pass
     if not comp_id:
         comp_id = pending_joins.pop(uid, None)
-    # If still no comp_id, can't continue
     if not comp_id:
         try:
             bot.answer_callback_query(call.id, "Kontekst topilmadi. Iltimos konkurs postidagi tugmani qayta bosing.", show_alert=True)
         except Exception:
             pass
         return
-    # Verify subscription
     if not check_subscription(uid):
         try:
             bot.answer_callback_query(call.id, "❌ Obuna aniqlanmadi. Iltimos kanallarga obuna bo'ling va qayta bosing.", show_alert=True)
@@ -729,7 +847,6 @@ def callback_confirm_sub(call: types.CallbackQuery):
         except Exception:
             pass
         return
-    # Add participant now
     added = add_participant(comp_id, uid, comment="")
     if added:
         try:
@@ -738,9 +855,10 @@ def callback_confirm_sub(call: types.CallbackQuery):
             pass
         try:
             bot.send_message(uid, "✅ Siz konkurs ishtirokchisiz! Omad tilaymiz 🎉")
-            bot.send_message(uid,
-                             "Ushbu bot orqali siz UC ishlashingiz mumkin.\n"
-                             "Menyudagi '🪙 UC islash' tugmasini bosib referal havolani do'stlaringizga ulashing; har bir taklif uchun 3 UC beriladi.")
+            bot.send_message(
+                uid,
+                "Ushbu bot orqali siz UC ishlashingiz mumkin.\nMenyudagi '🪙 UC islash' tugmasini bosib referal havolani do'stlaringizga ulashing; har bir taklif uchun 3 UC beriladi.",
+            )
         except Exception:
             pass
         update_competition_posts(comp_id)
@@ -750,9 +868,11 @@ def callback_confirm_sub(call: types.CallbackQuery):
         except Exception:
             pass
 
+
 # -----------------------
 # Remove unsubscribed participants & finishing competitions
 # -----------------------
+
 def remove_unsubscribed_participants():
     comps = load_json(COMPS_FILE)
     changed = False
@@ -775,10 +895,12 @@ def remove_unsubscribed_participants():
             comp["participants"] = remaining
             comps[comp_id] = comp
             changed = True
-            # notify removed users
             for p in removed:
                 try:
-                    bot.send_message(int(p.get("id")), f"❗ Siz Konkurs #{comp_id} dan chetlatildingiz — obuna bekor qilingan. Qaytadan qatnashish uchun obuna bo'ling va postdagi tugmani bosing.")
+                    bot.send_message(
+                        int(p.get("id")),
+                        f"❗ Siz Konkurs #{comp_id} dan chetlatildingiz — obuna bekor qilingan. Qaytadan qatnashish uchun obuna bo'ling va postdagi tugmani bosing.",
+                    )
                 except Exception:
                     pass
             try:
@@ -787,6 +909,7 @@ def remove_unsubscribed_participants():
                 pass
     if changed:
         save_json(COMPS_FILE, comps)
+
 
 def check_expired_competitions():
     comps = load_json(COMPS_FILE)
@@ -798,6 +921,7 @@ def check_expired_competitions():
             continue
         if now >= deadline and not comp.get("winners_announced", False):
             finish_competition(comp_id)
+
 
 def finish_competition(comp_id: str):
     comps = load_json(COMPS_FILE)
@@ -827,7 +951,11 @@ def finish_competition(comp_id: str):
         except Exception:
             mention = f"ID:{wid}"
         mentions.append(mention)
-    announce = f"🎊 Konkurs #{comp_id} yakunlandi! G'oliblar:\n" + "\n".join([f"{i+1}. {m}" for i, m in enumerate(mentions)]) + "\n\nAdminlar siz bilan bog'lanadi."
+    announce = (
+        f"🎊 Konkurs #{comp_id} yakunlandi! G'oliblar:\n"
+        + "\n".join([f"{i+1}. {m}" for i, m in enumerate(mentions)])
+        + "\n\nAdminlar siz bilan bog'lanadi."
+    )
     try:
         bot.send_message(GROUP_ID, announce)
         bot.send_message(CHANNEL_ID, announce)
@@ -848,22 +976,12 @@ def finish_competition(comp_id: str):
         except Exception:
             pass
 
-# -----------------------
-# Background worker thread
-# -----------------------
-def background_worker():
-    while True:
-        try:
-            remove_unsubscribed_participants()
-            check_expired_competitions()
-        except Exception as e:
-            print(f"[background_worker] error: {e}")
-        time.sleep(30)
 
 # -----------------------
-# Start command & Back handler
+# Commands: /start and Back handler
 # -----------------------
-@bot.message_handler(commands=["start"])
+
+@bot.message_handler(commands=["start"])  # NOTE: works via webhook
 def handler_start(message: types.Message):
     uid = message.from_user.id
     parts = message.text.split()
@@ -884,6 +1002,7 @@ def handler_start(message: types.Message):
         except Exception:
             pass
 
+
 @bot.message_handler(func=lambda m: m.text == "🔙 Ortga")
 @subscription_guard_message
 def handler_back(message: types.Message):
@@ -898,44 +1017,99 @@ def handler_back(message: types.Message):
     except Exception:
         pass
 
+
 # -----------------------
-# Run bot and health server
+# Background maintenance worker
 # -----------------------
-def start_flask_health():
+
+_worker_started = False
+_worker_lock = threading.Lock()
+
+
+def _background_worker_loop():
+    while True:
+        try:
+            remove_unsubscribed_participants()
+            check_expired_competitions()
+        except Exception as e:
+            print(f"[background_worker] error: {e}")
+        time.sleep(30)
+
+
+def start_background_worker_once():
+    global _worker_started
+    with _worker_lock:
+        if _worker_started:
+            return
+        t = threading.Thread(target=_background_worker_loop, daemon=True)
+        t.start()
+        _worker_started = True
+        print("Background worker started")
+
+
+# -----------------------
+# Flask webhook app (exported as `server`)
+# -----------------------
+
+server = Flask(__name__)
+
+
+@server.route(f"/{BOT_TOKEN}", methods=["POST"])
+def telegram_webhook():
     try:
-        from flask import Flask
+        update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
+        bot.process_new_updates([update])
     except Exception as e:
-        print("Flask is not installed. To bind a web port for deployments, install flask (pip install flask).")
-        return None
+        print(f"[webhook] failed to process update: {e}")
+    return "OK", 200
 
-    app = Flask(__name__)
 
-    @app.route("/", methods=["GET"])
-    def health():
-        return "OK", 200
+@server.route("/health", methods=["GET"])  # simple health check
+@server.route("/", methods=["GET"])
+def index():
+    """Sets (or re-sets) the webhook and shows a tiny status page."""
+    # Prefer explicit WEBHOOK_URL if provided, else build from HEROKU_APP_NAME
+    if WEBHOOK_URL:
+        base = WEBHOOK_URL.rstrip("/")
+    elif HEROKU_APP_NAME:
+        base = f"https://{HEROKU_APP_NAME}.herokuapp.com"
+    else:
+        return (
+            "WEBHOOK_URL yoki HEROKU_APP_NAME Config Var o'rnatilmagan. Webhook sozlanmadi.",
+            200,
+        )
 
-    port = int(os.environ.get("PORT", 10000))
-    def run():
-        # bind to 0.0.0.0 so platform can reach it
-        app.run(host="0.0.0.0", port=port)
+    # Ensure background worker is running (idempotent)
+    start_background_worker_once()
 
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    print(f"Flask health server started on port {port}")
-    return t
+    try:
+        bot.remove_webhook()
+        bot.set_webhook(url=f"{base}/{BOT_TOKEN}")
+        status = f"Webhook set to {base}/{BOT_TOKEN}"
+    except Exception as e:
+        status = f"Webhook set failed: {e}"
+    return status, 200
 
+
+# -----------------------
+# Local run (optional)
+# -----------------------
 if __name__ == "__main__":
-    print("Starting pubg.py bot...")
-    # Start background worker
-    worker = threading.Thread(target=background_worker, daemon=True)
-    worker.start()
+    # For local testing you may use polling OR local flask run.
+    # 1) Local Flask (simulate Heroku): visit http://localhost:5000 to set webhook to your public URL
+    # 2) Or enable polling (NOT for Heroku): uncomment the polling block below.
 
-    # Start Flask health server so deployment detects an open port
-    flask_thread = start_flask_health()
+    # start maintenance worker
+    start_background_worker_once()
 
-    try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=60)
-    except KeyboardInterrupt:
-        print("Bot stopped by user")
-    except Exception as e:
-        print(f"Bot crashed: {e}")
+    port = int(os.environ.get("PORT", 5000))
+    server.run(host="0.0.0.0", port=port)
+
+    # --- If you want polling locally (not Heroku), comment out server.run above and uncomment below ---
+    # try:
+    #     print("Starting polling...")
+    #     bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    # except KeyboardInterrupt:
+    #     print("Bot stopped by user")
+    # except Exception as e:
+    #     print(f"Bot crashed: {e}")
